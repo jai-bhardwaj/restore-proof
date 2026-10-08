@@ -1,0 +1,91 @@
+# Primary + streaming standby + WAL archive.
+#
+# Two containers rather than one because replication is the thing being
+# demonstrated, and a single node cannot demonstrate it. The archive volume is
+# shared read-write with the primary and read-only everywhere else: WAL is
+# written once and only ever read back.
+services:
+  primary:
+    image: postgres:16-alpine
+    container_name: rp-primary
+    environment:
+      POSTGRES_PASSWORD: primary
+      POSTGRES_DB: postgres
+      # Replication slot user. Separate role from the app on purpose.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command: >
+      postgres
+      -c wal_level=replica
+      -c archive_mode=on
+      -c archive_command='test ! -f /archive/%f && cp %p /archive/%f'
+      -c max_wal_senders=4
+      -c max_replication_slots=4
+      -c hot_standby=on
+      -c logging_collector=off
+      -c hba_file=/etc/postgresql/pg_hba.conf
+    volumes:
+      - ../data/primary:/var/lib/postgresql/data
+      - ../data/archive:/archive
+      - ../scripts/init-primary.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  standby:
+    image: postgres:16-alpine
+    container_name: rp-standby
+    depends_on:
+      primary: { condition: service_healthy }
+    environment:
+      PGPASSWORD: primary
+    # pg_basebackup -R writes the standby signal and primary_conninfo for us.
+    # Done in the entrypoint rather than baked in, so the standby is always a
+    # real copy of whatever the primary currently is.
+    # Overriding `command` bypasses the image entrypoint, which is what
+    # normally drops privileges. Postgres refuses to run as root, so the
+    # chown + su-exec here are doing the job the entrypoint would have.
+    command: >
+      sh -c '
+      if [ ! -s /var/lib/postgresql/data/PG_VERSION ]; then
+        rm -rf /var/lib/postgresql/data/* ;
+        until pg_basebackup -h primary -U postgres -D /var/lib/postgresql/data -Fp -Xs -R -v ; do
+          echo "basebackup not ready, retrying" ; sleep 3 ;
+        done ;
+      fi ;
+      chown -R postgres:postgres /var/lib/postgresql/data ;
+      chmod 700 /var/lib/postgresql/data ;
+      exec su-exec postgres postgres'
+    volumes:
+      - ../data/standby:/var/lib/postgresql/data
+    ports: ["55434:5432"]
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: rp-exporter
+    depends_on:
+      primary: { condition: service_healthy }
+    environment:
+      DATA_SOURCE_NAME: "postgresql://postgres:primary@primary:5432/postgres?sslmode=disable"
+    ports: ["59187:9187"]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: rp-prometheus
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["59090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: rp-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ../monitoring/grafana-datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
+    ports: ["53000:3000"]

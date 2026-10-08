@@ -1,0 +1,97 @@
+---
+# Provision and exercise the whole thing.
+#
+# The ordering is the point. `verify` runs AFTER `backup`, and the play fails
+# if verification does not reach VERIFIED. A pipeline that takes a backup and
+# reports green without restoring it is the thing this replaces, so it would be
+# incoherent for the automation to do exactly that.
+- name: restore-proof — provision, back up, and prove the backup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    project_dir: "{{ playbook_dir }}/.."
+    compose_file: "{{ project_dir }}/compose/docker-compose.yml"
+
+  tasks:
+    - name: Create data directories
+      ansible.builtin.file:
+        path: "{{ project_dir }}/data/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: [archive, primary, standby, basebackup]
+
+    - name: Bring up primary, standby and monitoring
+      ansible.builtin.command:
+        cmd: docker compose -f {{ compose_file }} up -d
+      changed_when: true
+
+    - name: Wait for the primary to accept connections
+      ansible.builtin.command:
+        cmd: docker exec rp-primary pg_isready -U postgres
+      register: ready
+      until: ready.rc == 0
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Wait for the standby to come out of recovery setup
+      ansible.builtin.command:
+        cmd: docker exec rp-standby pg_isready -U postgres
+      register: sb
+      until: sb.rc == 0
+      retries: 45
+      delay: 2
+      changed_when: false
+
+    - name: Confirm the standby is actually streaming, not merely running
+      ansible.builtin.command:
+        cmd: >
+          docker exec rp-primary psql -U postgres -tAc
+          "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming';"
+      register: streaming
+      until: streaming.stdout | trim | int > 0
+      retries: 30
+      delay: 2
+      changed_when: false
+      # A standby that is up but not streaming is a silent data-loss window.
+      # Asserting on pg_stat_replication is the difference between "the
+      # container is healthy" and "replication works".
+
+    - name: Take a base backup
+      ansible.builtin.command:
+        cmd: "{{ project_dir }}/scripts/take-basebackup.sh"
+      environment:
+        BACKUP_DIR: "{{ project_dir }}/data/basebackup"
+        STATE_FILE: "{{ project_dir }}/data/backup-state.json"
+      changed_when: true
+
+    - name: Prove the backup by restoring it
+      ansible.builtin.command:
+        cmd: "{{ project_dir }}/scripts/verify-restore.sh"
+      environment:
+        ARCHIVE_DIR: "{{ project_dir }}/data/archive"
+        BACKUP_DIR: "{{ project_dir }}/data/basebackup"
+        STATE_FILE: "{{ project_dir }}/data/backup-state.json"
+      register: verify
+      changed_when: true
+      failed_when: verify.rc != 0
+
+    - name: Read back the recorded state
+      ansible.builtin.slurp:
+        src: "{{ project_dir }}/data/backup-state.json"
+      register: state_raw
+
+    - name: Fail unless the backup reached VERIFIED
+      ansible.builtin.assert:
+        that:
+          - (state_raw.content | b64decode | from_json).status == 'VERIFIED'
+        fail_msg: >-
+          Backup state is
+          {{ (state_raw.content | b64decode | from_json).status }}, not VERIFIED.
+          An unrestored backup is not a backup.
+        success_msg: >-
+          VERIFIED —
+          {{ (state_raw.content | b64decode | from_json).rows_recovered }}
+          rows came back.
